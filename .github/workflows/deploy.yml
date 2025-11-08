@@ -1,245 +1,157 @@
-name: Deploy Laravel Application
+name: Deploy CodeIgniter App
 
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
-
-env:
-  AWS_REGION: us-east-1
-  APP_NAME: ${{ github.event.repository.name }}
+  workflow_dispatch:
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    
-    services:
-      mysql:
-        image: mysql:8.0
-        env:
-          MYSQL_ROOT_PASSWORD: password
-          MYSQL_DATABASE: test_db
-        ports:
-          - 3306:3306
-        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
-    
-    steps:
-    - uses: actions/checkout@v3
-    
-    - name: Setup PHP
-      uses: shivammathur/setup-php@v2
-      with:
-        php-version: '8.2'
-        extensions: mbstring, xml, ctype, iconv, intl, pdo_mysql, dom, filter, gd, json, zip
-        coverage: none
-    
-    - name: Copy .env
-      run: |
-        php -r "file_exists('.env') || copy('.env.example', '.env');"
-    
-    - name: Install Composer Dependencies
-      run: composer install --prefer-dist --no-progress --no-interaction
-    
-    - name: Generate Application Key
-      run: php artisan key:generate
-    
-    - name: Run Tests
-      env:
-        DB_CONNECTION: mysql
-        DB_HOST: 127.0.0.1
-        DB_PORT: 3306
-        DB_DATABASE: test_db
-        DB_USERNAME: root
-        DB_PASSWORD: password
-      run: |
-        php artisan migrate --force
-        php artisan test || echo "No tests found, skipping..."
-
   deploy:
-    needs: test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
     
     steps:
-    - uses: actions/checkout@v3
-    
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+    - name: Checkout code
+      uses: actions/checkout@v3
     
     - name: Setup PHP
       uses: shivammathur/setup-php@v2
       with:
         php-version: '8.2'
-        extensions: mbstring, xml, ctype, iconv, intl, pdo_mysql, dom, filter, gd, json, zip
+        extensions: mbstring, xml, ctype, json, mysql, pdo, pdo_mysql, curl, gd, zip
     
-    - name: Install Dependencies
-      run: composer install --prefer-dist --no-dev --optimize-autoloader --no-interaction
-    
-    - name: Prepare Deployment Package
+    - name: Create deployment package
       run: |
-        mkdir -p deployment
-        rsync -av --progress . deployment/ \
-          --exclude .git \
-          --exclude .github \
-          --exclude tests \
-          --exclude node_modules \
-          --exclude storage/logs/*.log \
-          --exclude .env
-        
-        # Create production .env
-        cat > deployment/.env << EOF
-        APP_NAME="${{ github.event.repository.name }}"
-        APP_ENV=production
-        APP_KEY=${{ secrets.APP_KEY }}
-        APP_DEBUG=false
-        APP_URL=https://${{ secrets.APP_SUBDOMAIN }}.infinityloop.online
-        
-        LOG_CHANNEL=stack
-        LOG_LEVEL=error
-        
-        DB_CONNECTION=mysql
-        DB_HOST=${{ secrets.DB_HOST }}
-        DB_PORT=3306
-        DB_DATABASE=${{ secrets.DB_DATABASE }}
-        DB_USERNAME=${{ secrets.DB_USERNAME }}
-        DB_PASSWORD=${{ secrets.DB_PASSWORD }}
-        
-        BROADCAST_DRIVER=log
-        CACHE_DRIVER=file
-        FILESYSTEM_DISK=s3
-        QUEUE_CONNECTION=database
-        SESSION_DRIVER=file
-        SESSION_LIFETIME=120
-        
-        AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
-        AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        AWS_DEFAULT_REGION=${{ env.AWS_REGION }}
-        AWS_BUCKET=${{ secrets.AWS_BUCKET }}
-        
-        MAIL_MAILER=smtp
-        MAIL_HOST=${{ secrets.MAIL_HOST }}
-        MAIL_PORT=587
-        MAIL_USERNAME=${{ secrets.MAIL_USERNAME }}
-        MAIL_PASSWORD=${{ secrets.MAIL_PASSWORD }}
-        MAIL_ENCRYPTION=tls
-        MAIL_FROM_ADDRESS=noreply@infinityloop.online
-        MAIL_FROM_NAME="${{ github.event.repository.name }}"
-        EOF
-        
-        cd deployment
-        tar -czf ../deployment.tar.gz .
-    
-    - name: Upload to S3
-      run: |
-        aws s3 cp deployment.tar.gz s3://infinityloop-deployments/${{ env.APP_NAME }}/deployment-$(date +%Y%m%d-%H%M%S).tar.gz
-        aws s3 cp deployment.tar.gz s3://infinityloop-deployments/${{ env.APP_NAME }}/latest.tar.gz
+        echo "📦 Creating deployment package..."
+        tar -czf deployment.tar.gz \
+          --exclude='.git' \
+          --exclude='.github' \
+          --exclude='node_modules' \
+          --exclude='.env.backup' \
+          .
+        echo "✅ Package created"
     
     - name: Deploy to EC2
+      uses: appleboy/scp-action@master
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USERNAME }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        source: "deployment.tar.gz"
+        target: "/tmp/"
+    
+    - name: Configure application on EC2
       uses: appleboy/ssh-action@master
       with:
         host: ${{ secrets.EC2_HOST }}
-        username: ubuntu
-        key: ${{ secrets.EC2_SSH_KEY }}
+        username: ${{ secrets.EC2_USERNAME }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
         script: |
           set -e
           
-          APP_DIR="/var/www/infinityloop/${{ secrets.APP_SHORT_NAME }}"
-          BACKUP_DIR="/var/backups/infinityloop/${{ secrets.APP_SHORT_NAME }}"
+          APP_NAME="${{ github.event.repository.name }}"
+          APP_DIR="/var/www/${APP_NAME}"
           
-          echo "🚀 Starting deployment for ${{ env.APP_NAME }}..."
+          echo "🚀 Deploying ${APP_NAME}..."
           
-          # Create backup
-          if [ -d "$APP_DIR" ]; then
-            echo "📦 Creating backup..."
-            sudo mkdir -p $BACKUP_DIR
-            sudo tar -czf $BACKUP_DIR/backup-$(date +%Y%m%d-%H%M%S).tar.gz -C $APP_DIR .
-          fi
+          # Create application directory
+          sudo mkdir -p ${APP_DIR}
           
-          # Download latest deployment
-          echo "⬇️  Downloading deployment package..."
-          aws s3 cp s3://infinityloop-deployments/${{ env.APP_NAME }}/latest.tar.gz /tmp/deployment.tar.gz
-          
-          # Extract to app directory
+          # Extract deployment package
           echo "📂 Extracting files..."
-          sudo mkdir -p $APP_DIR
-          sudo tar -xzf /tmp/deployment.tar.gz -C $APP_DIR
+          sudo tar -xzf /tmp/deployment.tar.gz -C ${APP_DIR}
           
           # Set permissions
-          echo "🔐 Setting permissions..."
-          sudo chown -R ubuntu:www-data $APP_DIR
-          sudo chmod -R 775 $APP_DIR/storage
-          sudo chmod -R 775 $APP_DIR/bootstrap/cache
+          echo "🔒 Setting permissions..."
+          sudo chown -R www-data:www-data ${APP_DIR}
+          sudo chmod -R 755 ${APP_DIR}
+          sudo chmod -R 777 ${APP_DIR}/uploads
           
-          # Run Laravel commands
-          cd $APP_DIR
+          # Create/update .env file for database config
+          echo "⚙️  Configuring database..."
+          sudo tee ${APP_DIR}/application/config/database.php > /dev/null <<'EOF'
+          <?php
+          defined('BASEPATH') OR exit('No direct script access allowed');
           
-          echo "🔄 Running migrations..."
-          php artisan migrate --force
+          $active_group = 'default';
+          $query_builder = TRUE;
           
-          echo "⚡ Optimizing application..."
-          php artisan config:cache
-          php artisan route:cache
-          php artisan view:cache
-          php artisan optimize
+          $db['default'] = array(
+              'dsn'   => '',
+              'hostname' => '${{ secrets.DB_HOST }}',
+              'username' => '${{ secrets.DB_USERNAME }}',
+              'password' => '${{ secrets.DB_PASSWORD }}',
+              'database' => 'school_erp',
+              'dbdriver' => 'mysqli',
+              'dbprefix' => '',
+              'pconnect' => FALSE,
+              'db_debug' => FALSE,
+              'cache_on' => FALSE,
+              'cachedir' => '',
+              'char_set' => 'utf8',
+              'dbcollat' => 'utf8_general_ci',
+              'swap_pre' => '',
+              'encrypt' => FALSE,
+              'compress' => FALSE,
+              'stricton' => FALSE,
+              'failover' => array(),
+              'save_queries' => TRUE
+          );
+          EOF
           
-          # Queue workers (if needed)
-          if [ -f "artisan" ]; then
-            echo "🔄 Restarting queue workers..."
-            php artisan queue:restart
-          fi
+          # Update base URL in config
+          echo "🌐 Updating base URL..."
+          sudo sed -i "s|http://localhost/|http://school-erp.infinityloop.com/|g" ${APP_DIR}/application/config/config.php || true
           
-          # Restart services
-          echo "🔄 Restarting services..."
-          sudo systemctl restart php8.2-fpm
-          sudo systemctl reload nginx
+          # Create Nginx configuration
+          echo "🌐 Configuring Nginx..."
+          sudo tee /etc/nginx/sites-available/school-erp > /dev/null <<'NGINX'
+          server {
+              listen 80;
+              server_name school-erp.infinityloop.com;
+              
+              root /var/www/${{ github.event.repository.name }};
+              index index.php index.html;
+              
+              access_log /var/log/nginx/school-erp-access.log;
+              error_log /var/log/nginx/school-erp-error.log;
+              
+              location / {
+                  try_files \$uri \$uri/ /index.php?\$query_string;
+              }
+              
+              location ~ \.php$ {
+                  include snippets/fastcgi-php.conf;
+                  fastcgi_pass unix:/var/run/php/php8.2-fpm.sock;
+                  fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+                  include fastcgi_params;
+              }
+              
+              location ~ /\.ht {
+                  deny all;
+              }
+              
+              location ~* \.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot)$ {
+                  expires 365d;
+                  add_header Cache-Control "public, immutable";
+              }
+          }
+          NGINX
           
-          # Cleanup
-          rm /tmp/deployment.tar.gz
+          # Enable site and reload Nginx
+          sudo ln -sf /etc/nginx/sites-available/school-erp /etc/nginx/sites-enabled/
+          sudo nginx -t && sudo systemctl reload nginx
           
-          # Keep only last 5 backups
-          cd $BACKUP_DIR
-          ls -t | tail -n +6 | xargs -r rm
+          # Clean up
+          rm -f /tmp/deployment.tar.gz
           
-          echo "✅ Deployment complete!"
+          echo "✅ Deployment completed successfully!"
+          echo "🌐 Application available at: http://school-erp.infinityloop.com"
     
-    - name: Health Check
+    - name: Deployment Status
+      if: always()
       run: |
-        sleep 10
-        curl -f https://${{ secrets.APP_SUBDOMAIN }}.infinityloop.online/health || exit 1
-        echo "✅ Health check passed!"
-    
-    - name: Notify Success
-      if: success()
-      run: |
-        echo "✅ Deployment successful for ${{ env.APP_NAME }}"
-        # Add Slack/Discord notification here if needed
-    
-    - name: Rollback on Failure
-      if: failure()
-      uses: appleboy/ssh-action@master
-      with:
-        host: ${{ secrets.EC2_HOST }}
-        username: ubuntu
-        key: ${{ secrets.EC2_SSH_KEY }}
-        script: |
-          echo "❌ Deployment failed, rolling back..."
-          APP_DIR="/var/www/infinityloop/${{ secrets.APP_SHORT_NAME }}"
-          BACKUP_DIR="/var/backups/infinityloop/${{ secrets.APP_SHORT_NAME }}"
-          
-          # Get latest backup
-          LATEST_BACKUP=$(ls -t $BACKUP_DIR/backup-*.tar.gz | head -1)
-          
-          if [ -f "$LATEST_BACKUP" ]; then
-            echo "📦 Restoring from backup: $LATEST_BACKUP"
-            sudo tar -xzf $LATEST_BACKUP -C $APP_DIR
-            sudo systemctl restart php8.2-fpm
-            sudo systemctl reload nginx
-            echo "✅ Rollback complete!"
-          else
-            echo "⚠️  No backup found for rollback"
-          fi
+        if [ ${{ job.status }} == 'success' ]; then
+          echo "✅ Deployment successful!"
+        else
+          echo "❌ Deployment failed!"
+        fi
